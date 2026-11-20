@@ -1,0 +1,219 @@
+
+name: Build Clash Of Verse APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clash-of-verse-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Find ZIP and Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    container:
+      image: barichello/godot-ci:4.4.1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Search EVERY directory for ZIP files
+      - name: Search entire project and extract Godot ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SEARCH_DIR="$GITHUB_WORKSPACE"
+          EXTRACT_DIR="/tmp/clash-of-verse-project"
+
+          mkdir -p "$EXTRACT_DIR"
+
+          echo "Searching entire repository recursively..."
+
+          mapfile -d '' ZIP_FILES < <(
+            find "$SEARCH_DIR" \
+              -type d \( -name ".git" -o -path "*/.godot" \) -prune \
+              -o -type f -iname "*.zip" -print0
+          )
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "ERROR: No ZIP files found."
+            exit 1
+          fi
+
+          echo "Found ${#ZIP_FILES[@]} ZIP file(s)."
+
+          FOUND_PROJECT=""
+
+          for ZIP_FILE in "${ZIP_FILES[@]}"; do
+            echo "--------------------------------"
+            echo "Checking: $ZIP_FILE"
+
+            if ! unzip -tq "$ZIP_FILE" >/dev/null 2>&1; then
+              echo "Invalid ZIP. Skipping."
+              continue
+            fi
+
+            TEMP_DIR=$(mktemp -d)
+
+            if ! unzip -oq "$ZIP_FILE" -d "$TEMP_DIR"; then
+              rm -rf "$TEMP_DIR"
+              continue
+            fi
+
+            PROJECT_FILE=$(find "$TEMP_DIR" \
+              -type f \
+              -name "project.godot" \
+              -not -path "*/.godot/*" \
+              -print -quit)
+
+            if [ -n "$PROJECT_FILE" ]; then
+              FOUND_PROJECT=$(dirname "$PROJECT_FILE")
+
+              echo "Godot project found!"
+              echo "ZIP: $ZIP_FILE"
+              echo "Project: $FOUND_PROJECT"
+
+              break
+            fi
+
+            rm -rf "$TEMP_DIR"
+          done
+
+          if [ -z "$FOUND_PROJECT" ]; then
+            echo "ERROR: No Godot project found inside any ZIP."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$FOUND_PROJECT" >> "$GITHUB_ENV"
+
+          echo "Project extraction completed."
+
+      # Verify project files
+      - name: Verify Godot project
+        run: |
+          set -e
+
+          test -f "$PROJECT_DIR/project.godot"
+          test -f "$PROJECT_DIR/export_presets.cfg"
+
+          echo "Godot project verified."
+
+          echo "Project files:"
+          ls -la "$PROJECT_DIR"
+
+      # Create temporary signing key
+      - name: Prepare Android signing
+        run: |
+          set -e
+
+          mkdir -p /tmp/clash-keys
+
+          keytool -genkeypair \
+            -keystore /tmp/clash-keys/clash-release.jks \
+            -alias clashofverse \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass android123 \
+            -keypass android123 \
+            -dname "CN=Clash Of Verse"
+
+          echo "KEYSTORE_PATH=/tmp/clash-keys/clash-release.jks" >> "$GITHUB_ENV"
+
+      # Configure Android export preset
+      - name: Configure Android export
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          path = Path(os.environ["PROJECT_DIR"]) / "export_presets.cfg"
+
+          data = path.read_text(encoding="utf-8")
+
+          replacements = {
+              "version/code": str(int(os.environ["GITHUB_RUN_NUMBER"])),
+              "version/name": f'"0.1.{os.environ["GITHUB_RUN_NUMBER"]}"',
+              "keystore/release": f'"{os.environ["KEYSTORE_PATH"]}"',
+              "keystore/release_user": '"clashofverse"',
+              "keystore/release_password": '"android123"',
+          }
+
+          for key, value in replacements.items():
+              pattern = rf"(?m)^{re.escape(key)}=.*$"
+              line = f"{key}={value}"
+
+              if re.search(pattern, data):
+                  data = re.sub(pattern, lambda _: line, data)
+              else:
+                  data += "\n" + line
+
+          path.write_text(data, encoding="utf-8")
+
+          print("Android export configured.")
+          PY
+
+      # Import Godot resources
+      - name: Import Godot project
+        run: |
+          godot --headless \
+            --editor \
+            --path "$PROJECT_DIR" \
+            --quit
+
+      # Build APK
+      - name: Build Android APK
+        run: |
+          set -e
+
+          OUTPUT_DIR="$GITHUB_WORKSPACE/build-output"
+
+          mkdir -p "$OUTPUT_DIR"
+
+          godot --headless \
+            --path "$PROJECT_DIR" \
+            --export-release "Android" \
+            "$OUTPUT_DIR/ClashOfVerse.apk"
+
+          if [ ! -s "$OUTPUT_DIR/ClashOfVerse.apk" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK generated successfully."
+          ls -lh "$OUTPUT_DIR/ClashOfVerse.apk"
+
+      # Verify APK
+      - name: Verify APK
+        run: |
+          set -e
+
+          APK="$GITHUB_WORKSPACE/build-output/ClashOfVerse.apk"
+
+          if command -v apksigner >/dev/null 2>&1; then
+            apksigner verify --verbose "$APK"
+          else
+            echo "WARNING: apksigner not available."
+          fi
+
+          file "$APK"
+
+      # Upload final APK
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClashOfVerse-Android-${{ github.run_number }}
+          path: build-output/ClashOfVerse.apk
+          if-no-files-found: error
+          retention-days: 30
