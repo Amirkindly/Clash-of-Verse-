@@ -1,0 +1,135 @@
+
+name: Build Clash Of Verse APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: clash-of-verse-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    container:
+      image: barichello/godot-ci:4.4.1
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Verify Godot project
+        run: |
+          if [ ! -f project.godot ]; then
+            echo "ERROR: project.godot not found!"
+            exit 1
+          fi
+
+          if [ ! -f export_presets.cfg ]; then
+            echo "ERROR: export_presets.cfg not found!"
+            exit 1
+          fi
+
+          echo "Clash Of Verse project found."
+
+      - name: Prepare Android signing key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          mkdir -p keys
+
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ] && [ -n "$KS_ALIAS" ]; then
+            echo "$KS_B64" | base64 -d > keys/clash-release.jks
+            echo "KEYSTORE_PATH=$GITHUB_WORKSPACE/keys/clash-release.jks" >> $GITHUB_ENV
+            echo "KEYSTORE_PASSWORD=$KS_PASS" >> $GITHUB_ENV
+            echo "KEYSTORE_ALIAS=$KS_ALIAS" >> $GITHUB_ENV
+          else
+            echo "Creating temporary signing key..."
+
+            keytool -genkeypair \
+              -keystore keys/clash-temp.jks \
+              -alias clashofverse \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android123 \
+              -keypass android123 \
+              -dname "CN=Clash Of Verse"
+
+            echo "KEYSTORE_PATH=$GITHUB_WORKSPACE/keys/clash-temp.jks" >> $GITHUB_ENV
+            echo "KEYSTORE_PASSWORD=android123" >> $GITHUB_ENV
+            echo "KEYSTORE_ALIAS=clashofverse" >> $GITHUB_ENV
+          fi
+
+      - name: Configure Android export
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          path = Path("export_presets.cfg")
+          data = path.read_text(encoding="utf-8")
+
+          replacements = {
+              "version/code": str(int(os.environ["GITHUB_RUN_NUMBER"])),
+              "version/name": f'"0.1.{os.environ["GITHUB_RUN_NUMBER"]}"',
+              "keystore/release": f'"{os.environ["KEYSTORE_PATH"]}"',
+              "keystore/release_user": f'"{os.environ["KEYSTORE_ALIAS"]}"',
+              "keystore/release_password": f'"{os.environ["KEYSTORE_PASSWORD"]}"',
+          }
+
+          for key, value in replacements.items():
+              line = f"{key}={value}"
+              pattern = rf"(?m)^{re.escape(key)}=.*$"
+
+              if re.search(pattern, data):
+                  data = re.sub(pattern, lambda _: line, data)
+              else:
+                  data += "\n" + line
+
+          path.write_text(data, encoding="utf-8")
+          PY
+
+      - name: Import Godot project
+        run: |
+          mkdir -p build
+          godot --headless --editor --path . --quit
+
+      - name: Build Android Release APK
+        run: |
+          godot --headless \
+            --path . \
+            --export-release "Android" \
+            build/ClashOfVerse.apk
+
+          test -s build/ClashOfVerse.apk
+
+      - name: Verify APK signature
+        run: |
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
+            -type f -name apksigner | sort -V | tail -1)
+
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --verbose build/ClashOfVerse.apk
+          else
+            echo "WARNING: apksigner not found."
+          fi
+
+      - name: Upload Clash Of Verse APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClashOfVerse-Android-${{ github.run_number }}
+          path: build/ClashOfVerse.apk
+          if-no-files-found: error
+          retention-days: 14
