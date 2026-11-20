@@ -1,0 +1,155 @@
+name: Build Clash Of Verse APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.4.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find Godot project (or extract zip)
+        run: |
+          if [ -f project.godot ]; then
+            DIR="$GITHUB_WORKSPACE"
+          else
+            PG=$(find . -name project.godot -not -path "./.git/*" -not -path "*/.godot/*" | head -1)
+            if [ -z "$PG" ]; then
+              ZIP=$(find . -iname "*.zip" -not -path "./.git/*" | sort -V | tail -1)
+              [ -z "$ZIP" ] && { echo "ERROR: project.godot and zip not found"; exit 1; }
+              echo "Using zip: $ZIP"
+              mkdir -p src_unzipped
+              unzip -q "$ZIP" -d src_unzipped || true
+              rm -rf src_unzipped/__MACOSX
+              PG=$(find src_unzipped -name project.godot | head -1)
+              [ -z "$PG" ] && { echo "ERROR: project.godot not found in zip"; exit 1; }
+            fi
+            DIR="$(cd "$(dirname "$PG")" && pwd)"
+          fi
+          echo "PROJECT_DIR=$DIR" >> $GITHUB_ENV
+          echo "Project dir: $DIR"
+          [ -f "$DIR/export_presets.cfg" ] || { echo "ERROR: export_presets.cfg missing"; exit 1; }
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Android SDK components
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platform-tools" "build-tools;35.0.1" "platforms;android-35" "cmdline-tools;latest" > /dev/null
+          echo "ANDROID_SDK=$ANDROID_HOME" >> $GITHUB_ENV
+
+      - name: Cache Godot download
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/godot-dl
+          key: godot-${{ env.GODOT_VERSION }}
+
+      - name: Download Godot + export templates
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/godot-dl && cd ~/godot-dl
+          BASE="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable"
+          curl -fsSL -o godot.zip "$BASE/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          curl -fsSL -o templates.tpz "$BASE/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+
+      - name: Install Godot
+        run: |
+          cd ~/godot-dl
+          unzip -q -o godot.zip
+          sudo mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          TPL=~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          mkdir -p "$TPL"
+          unzip -q -o templates.tpz -d tpl
+          mv tpl/templates/* "$TPL"/
+          godot --version
+
+      - name: Configure Godot editor settings (Android SDK / Java)
+        run: |
+          mkdir -p ~/.config/godot
+          for f in editor_settings-4.tres editor_settings-4.4.tres; do
+            cat > ~/.config/godot/$f <<EOS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_SDK"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          EOS
+          done
+
+      - name: Set version in export preset
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          python3 - <<'PY'
+          import re, os
+          run = os.environ.get("RUN_NUMBER", "1")
+          s = open("export_presets.cfg", encoding="utf-8").read()
+          s = re.sub(r'(?m)^version/code=.*$', f'version/code={run}', s)
+          s = re.sub(r'(?m)^version/name=.*$', f'version/name="0.1.{run}"', s)
+          open("export_presets.cfg", "w", encoding="utf-8").write(s)
+          PY
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            PASS="$KS_PASS"; ALIAS="$KS_ALIAS"
+            echo "Using keystore from secrets"
+          else
+            PASS="android123"; ALIAS="temp"
+            keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" -dname "CN=ClashOfVerse"
+            echo "Using temporary keystore"
+          fi
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$RUNNER_TEMP/release.jks" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=$ALIAS" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=$PASS" >> $GITHUB_ENV
+
+      - name: Import project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          godot --headless --import || true
+          godot --headless --import || true
+
+      - name: Export release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p build
+          godot --headless --export-release "Android" build/ClashOfVerse.apk
+          [ -s build/ClashOfVerse.apk ] || { echo "ERROR: APK was not created"; exit 1; }
+
+      - name: Verify APK signature
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/35.0.1"
+          "$BT/apksigner" verify --verbose build/ClashOfVerse.apk
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp build/ClashOfVerse.apk "$GITHUB_WORKSPACE/dist/ClashOfVerse.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClashOfVerse-APK
+          path: dist/ClashOfVerse.apk
+          if-no-files-found: error
