@@ -117,6 +117,33 @@ jobs:
           echo "JAVA_HOME=$JAVA_HOME"
           ls "$JAVA_HOME/bin/java"
 
+      - name: Patch project settings for Android (ETC2/ASTC + icon)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          python3 - <<'PY'
+          import re
+          s = open("project.godot", encoding="utf-8").read()
+          def put(section, key, val):
+              global s
+              line = f"{key}={val}"
+              m = re.search(r"(?ms)^\[%s\]\n(.*?)(?=^\[|\Z)" % re.escape(section), s)
+              if not m:
+                  s = s.rstrip("\n") + f"\n\n[{section}]\n\n{line}\n"
+                  return
+              body = m.group(1)
+              if re.search(r"(?m)^%s=" % re.escape(key), body):
+                  new = re.sub(r"(?m)^%s=.*$" % re.escape(key), lambda _: line, body)
+              else:
+                  new = body.rstrip("\n") + "\n" + line + "\n\n"
+              s = s[:m.start(1)] + new + s[m.end(1):]
+          put("rendering", "textures/vram_compression/import_etc2_astc", "true")
+          put("application", "config/icon", '"res://assets/clash_of_verse_splash.png"')
+          open("project.godot", "w", encoding="utf-8").write(s)
+          PY
+          echo "--- project.godot ---"
+          cat project.godot
+          rm -rf .godot
+
       - name: Prepare signing key + patch export preset
         env:
           KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
