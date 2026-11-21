@@ -78,10 +78,15 @@ jobs:
           mkdir -p "$TPL"
           unzip -q -o templates.tpz -d tpl
           mv tpl/templates/* "$TPL"/
+          ls "$TPL" | head -30
           godot --version
 
-      - name: Configure Godot editor settings (Android SDK / Java)
+      - name: Create debug keystore + configure Godot editor settings
         run: |
+          keytool -genkeypair -v -keystore "$HOME/debug.keystore" -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US" > /dev/null
           mkdir -p ~/.config/godot
           for f in editor_settings-4.tres editor_settings-4.4.tres; do
             cat > ~/.config/godot/$f <<EOS
@@ -90,28 +95,19 @@ jobs:
           [resource]
           export/android/android_sdk_path = "$ANDROID_SDK"
           export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/debug_keystore = "$HOME/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
           EOS
           done
+          cat ~/.config/godot/editor_settings-4.4.tres
 
-      - name: Set version in export preset
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          python3 - <<'PY'
-          import re, os
-          run = os.environ.get("RUN_NUMBER", "1")
-          s = open("export_presets.cfg", encoding="utf-8").read()
-          s = re.sub(r'(?m)^version/code=.*$', f'version/code={run}', s)
-          s = re.sub(r'(?m)^version/name=.*$', f'version/name="0.1.{run}"', s)
-          open("export_presets.cfg", "w", encoding="utf-8").write(s)
-          PY
-        env:
-          RUN_NUMBER: ${{ github.run_number }}
-
-      - name: Prepare signing key
+      - name: Prepare signing key + patch export preset
         env:
           KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
           KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
           KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           if [ -n "$KS_B64" ]; then
             echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
@@ -123,9 +119,32 @@ jobs:
               -storepass "$PASS" -keypass "$PASS" -dname "CN=ClashOfVerse"
             echo "Using temporary keystore"
           fi
-          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$RUNNER_TEMP/release.jks" >> $GITHUB_ENV
-          echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=$ALIAS" >> $GITHUB_ENV
-          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=$PASS" >> $GITHUB_ENV
+          export KS_PATH="$RUNNER_TEMP/release.jks" KS_USER="$ALIAS" KS_PW="$PASS"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$KS_PATH" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=$KS_USER" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=$KS_PW" >> $GITHUB_ENV
+          cd "$PROJECT_DIR"
+          python3 - <<'PY'
+          import re, os
+          run = os.environ["RUN_NUMBER"]
+          vals = {
+              "version/code": run,
+              "version/name": '"0.1.%s"' % run,
+              "keystore/release": '"%s"' % os.environ["KS_PATH"],
+              "keystore/release_user": '"%s"' % os.environ["KS_USER"],
+              "keystore/release_password": '"%s"' % os.environ["KS_PW"],
+              "package/signed": "true",
+          }
+          s = open("export_presets.cfg", encoding="utf-8").read()
+          for k, v in vals.items():
+              line = "%s=%s" % (k, v)
+              if re.search(r"(?m)^" + re.escape(k) + r"=", s):
+                  s = re.sub(r"(?m)^" + re.escape(k) + r"=.*$", lambda m: line, s)
+              else:
+                  s = s.replace("[preset.0.options]\n", "[preset.0.options]\n" + line + "\n")
+          open("export_presets.cfg", "w", encoding="utf-8").write(s)
+          PY
+          grep -v "password" export_presets.cfg
 
       - name: Import project
         working-directory: ${{ env.PROJECT_DIR }}
@@ -137,7 +156,7 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           mkdir -p build
-          godot --headless --export-release "Android" build/ClashOfVerse.apk
+          godot --headless --verbose --export-release "Android" build/ClashOfVerse.apk 2>&1 | tail -80
           [ -s build/ClashOfVerse.apk ] || { echo "ERROR: APK was not created"; exit 1; }
 
       - name: Verify APK signature
